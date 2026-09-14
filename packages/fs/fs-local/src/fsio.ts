@@ -18,6 +18,8 @@ const BINARY_SAMPLE_BYTES = 8192
 const realpath = promisify(realpathCallback.native)
 // Bound one non-abortable FileHandle.read so cancellation is observed between chunks.
 const DIFF_BASIS_READ_CHUNK_BYTES = 64 * 1024
+/** UTF-8 byte-order mark (`U+FEFF`), written to disk as `EF BB BF`. */
+const UTF8_BOM = '\uFEFF'
 
 function isENOENT(error: unknown): boolean {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT'
@@ -703,6 +705,54 @@ function restoreLineEndings(content: string, lineEndings: LineEndings): string {
   return lineEndings === 'LF' ? content : normalizeLineEndings(content).split('\n').join('\r\n')
 }
 
+/**
+ * Whether a raw file buffer opens with the UTF-8 byte-order mark. A buffer too
+ * short to hold the mark cannot have one.
+ * @param buffer - the file's bytes, before decoding.
+ * @returns true when the first three bytes are `EF BB BF`.
+ */
+function hasUtf8Bom(buffer: Uint8Array): boolean {
+  return buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF
+}
+
+/**
+ * Re-apply the UTF-8 byte-order mark detected at read time. `TextDecoder`
+ * consumes a leading BOM while decoding, so without this an edit would silently
+ * drop the file's only in-band declaration that its bytes are UTF-8 — turning a
+ * machine-independent encoding into one that each reader has to guess. The mark
+ * is deliberately kept out of the before/after diff basis: it is an encoding
+ * property, not content, and a phantom first-line change on every edit of a
+ * BOM-carrying file would be worse than the omission this repairs.
+ * @param content - the decoded (edited) text, mark-free by construction.
+ * @param bom - whether the original file opened with the mark, as detected by {@link readForEdit}.
+ * @returns the text with the mark restored, or unchanged when the file had none.
+ */
+function restoreBom(content: string, bom: boolean): string {
+  return bom ? UTF8_BOM + content : content
+}
+
+/**
+ * The UTF-8 BOM an overwrite must keep. A whole-content write owns its text but
+ * not the destination's encoding declaration: replacing a BOM-carrying file with
+ * content that omits the mark would silently change how every other reader
+ * decodes it, which is the same defect a BOM-dropping edit has. Content that
+ * already carries the mark is left untouched, so a caller that declares one
+ * itself is never given a second.
+ * @param target - the resolved destination being overwritten.
+ * @param content - the replacement text.
+ * @param signal - aborts the head read (`FS_ABORTED`).
+ * @returns the content with the destination's mark restored when it had one and the replacement lacks it; otherwise the content unchanged.
+ */
+export async function keepDestinationBom(
+  target: LocalTarget,
+  content: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (content.startsWith(UTF8_BOM)) return content
+  const head = await readByteWindow(target, { offset: 0, length: 3 }, signal)
+  return restoreBom(content, hasUtf8Bom(head))
+}
+
 function countOccurrences(content: string, needle: string): number {
   let count = 0
   let index = 0
@@ -716,23 +766,25 @@ function countOccurrences(content: string, needle: string): number {
 
 /**
  * Read and decode a file for editing: rejects binaries, returns LF-normalized
- * content plus the original line-ending style for write-back.
+ * content plus the two byte-level properties an edit must not change — the
+ * original line-ending style, and whether the file opened with a UTF-8 BOM.
  * @param absolutePath - the file to read (typically a target key).
  * @param displayPath - the caller-facing path used in error messages.
  * @param signal - aborts the read (`FS_ABORTED`).
- * @returns the LF-normalized content and the detected style to restore on write-back.
+ * @returns the LF-normalized content and the detected style and BOM to restore on write-back.
  */
 export async function readForEdit(
   absolutePath: string,
   displayPath: string,
   signal?: AbortSignal,
-): Promise<{ content: string; lineEndings: LineEndings }> {
+): Promise<{ content: string; lineEndings: LineEndings; bom: boolean }> {
   throwIfAborted(signal, 'edit')
   const buffer = await readFileAbortable(absolutePath, 'edit', signal)
   throwIfAborted(signal, 'edit')
   if (buffer.includes(0)) throw new FsError(`cannot edit "${displayPath}": binary file`, 'FS_NOT_TEXT')
+  const bom = hasUtf8Bom(buffer)
   const raw = decodeUtf8(buffer, 'edit', displayPath)
-  return { content: normalizeLineEndings(raw), lineEndings: detectLineEndings(raw) }
+  return { content: normalizeLineEndings(raw), lineEndings: detectLineEndings(raw), bom }
 }
 
 /**
@@ -833,4 +885,4 @@ export function applyLiteralEdit(
   return { content: content.split(oldNorm).join(newNorm), replacements }
 }
 
-export { normalizeLineEndings, restoreLineEndings }
+export { normalizeLineEndings, restoreBom, restoreLineEndings }

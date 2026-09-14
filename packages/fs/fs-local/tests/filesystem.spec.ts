@@ -532,6 +532,36 @@ describe('writeText', () => {
     expect(outcome.after).toBe('new body')
   })
 
+  it('keeps the destination BOM across an overwrite whose content omits it', async () => {
+    const file = join(dir, 'bom.txt')
+    await writeFile(file, Buffer.from('\uFEFFold body', 'utf8'))
+    const target = await fs.resolve('bom.txt')
+    const outcome = await fs.writeText(target, 'new body')
+    // The mark is an encoding declaration, not content: it stays out of the basis.
+    expect(outcome.before).toBe('old body')
+    expect(outcome.after).toBe('new body')
+    expect(await readFile(file, 'utf8')).toBe('\uFEFFnew body')
+    expect([...(await readFile(file)).subarray(0, 3)]).toEqual([0xEF, 0xBB, 0xBF])
+  })
+
+  it('does not double a BOM the written content already carries', async () => {
+    const file = join(dir, 'bom.txt')
+    await writeFile(file, Buffer.from('\uFEFFold', 'utf8'))
+    const target = await fs.resolve('bom.txt')
+    await fs.writeText(target, '\uFEFFnew')
+    expect(await readFile(file, 'utf8')).toBe('\uFEFFnew')
+  })
+
+  it('does not invent a BOM on a create or on a plain overwrite', async () => {
+    const created = await fs.resolve('new.txt')
+    await fs.writeText(created, 'fresh')
+    expect([...(await readFile(join(dir, 'new.txt'))).subarray(0, 3)]).toEqual([0x66, 0x72, 0x65])
+    await writeFile(join(dir, 'plain.txt'), 'old')
+    const target = await fs.resolve('plain.txt')
+    await fs.writeText(target, 'new')
+    expect(await readFile(join(dir, 'plain.txt'), 'utf8')).toBe('new')
+  })
+
   it('an overwrite returns LF-normalized before AND after (a CRLF rewrite is not every-line-changed)', async () => {
     // The applied-hunk diff bases on `before`/`after`; if `after` kept CRLF while
     // `before` is LF-normalized, a CRLF rewrite would read as every line changed.
@@ -672,6 +702,30 @@ describe('editText', () => {
     // The written file keeps the original CRLF endings (before/after are the
     // LF-normalized diff basis, not the on-disk bytes).
     expect(await readFile(join(dir, 'a.txt'), 'utf8')).toBe('a\r\nNEW\r\nb\r\n')
+  })
+
+  it('preserves a leading UTF-8 BOM across an edit, without it entering the diff basis', async () => {
+    const file = join(dir, 'bom.txt')
+    await writeFile(file, Buffer.from('\uFEFFhello world', 'utf8'))
+    const target = await fs.resolve('bom.txt')
+    const outcome = await fs.editText(target, { oldString: 'world', newString: 'there', replaceAll: false }, { version: await versionOf(target) })
+    // The mark is an encoding property, not content: keeping it out of the basis
+    // is what stops every edit of a BOM-carrying file reading as a changed first line.
+    expect(outcome.before).toBe('hello world')
+    expect(outcome.after).toBe('hello there')
+    expect(await readFile(file, 'utf8')).toBe('\uFEFFhello there')
+    const raw = await readFile(file)
+    expect([...raw.subarray(0, 3)]).toEqual([0xEF, 0xBB, 0xBF])
+  })
+
+  it('does not add a BOM to a file that has none', async () => {
+    const file = join(dir, 'plain.txt')
+    await writeFile(file, 'hello world')
+    const target = await fs.resolve('plain.txt')
+    await fs.editText(target, { oldString: 'world', newString: 'there', replaceAll: false }, { version: await versionOf(target) })
+    const raw = await readFile(file)
+    expect(raw[0]).toBe('h'.charCodeAt(0))
+    expect(await readFile(file, 'utf8')).toBe('hello there')
   })
 
   it('checks the stale version BEFORE literal matching', async () => {

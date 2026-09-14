@@ -12,6 +12,7 @@ import { isAbsolute, join, parse, relative, resolve } from 'node:path'
 import { createServer } from 'node:net'
 import {
   applyLiteralEdit,
+  keepDestinationBom,
   listDirectory,
   probe,
   probeNoFollow,
@@ -19,6 +20,7 @@ import {
   readTextForDiff,
   readWholeText,
   resolveLocalTarget,
+  restoreBom,
   restoreLineEndings,
   streamWholeText,
   writeFileAtomic,
@@ -970,6 +972,41 @@ describe('readForEdit + restoreLineEndings', () => {
     expect(original.lineEndings).toBe('CRLF')
     const edited = applyLiteralEdit(original.content, 'two', 'TWO', false, file)
     expect(restoreLineEndings(edited.content, original.lineEndings)).toBe('one\r\nTWO\r\n')
+  })
+
+  it('reports a UTF-8 BOM without leaking it into the content, and restores it on write-back', async () => {
+    const file = join(dir, 'bom.txt')
+    await writeFile(file, Buffer.from('\uFEFFone\r\ntwo\r\n', 'utf8'))
+    const original = await readForEdit(file, file)
+    expect(original.bom).toBe(true)
+    // The mark is an encoding declaration, not content: matching must not see it.
+    expect(original.content).toBe('one\ntwo\n')
+    expect(original.lineEndings).toBe('CRLF')
+    const edited = applyLiteralEdit(original.content, 'two', 'TWO', false, file)
+    expect(restoreBom(restoreLineEndings(edited.content, original.lineEndings), original.bom))
+      .toBe('\uFEFFone\r\nTWO\r\n')
+  })
+
+  it('reports no BOM for a plain file, and none for a file shorter than the mark', async () => {
+    const plain = join(dir, 'plain.txt')
+    await writeFile(plain, 'one\ntwo')
+    expect((await readForEdit(plain, plain)).bom).toBe(false)
+    const short = join(dir, 'short.txt')
+    await writeFile(short, 'a')
+    expect((await readForEdit(short, short)).bom).toBe(false)
+    // Without the mark there is nothing to restore, so restoreBom is identity.
+    expect(restoreBom('one', false)).toBe('one')
+  })
+
+  it('keeps a destination BOM for an overwrite, without doubling a caller-declared one', async () => {
+    const bom = join(dir, 'bom.txt')
+    await writeFile(bom, Buffer.from('\uFEFFbody', 'utf8'))
+    expect(await keepDestinationBom(localTarget(bom), 'new')).toBe('\uFEFFnew')
+    expect(await keepDestinationBom(localTarget(bom), '\uFEFFnew')).toBe('\uFEFFnew')
+    // An empty destination has no head that could carry a mark.
+    const empty = join(dir, 'empty.txt')
+    await writeFile(empty, '')
+    expect(await keepDestinationBom(localTarget(empty), 'new')).toBe('new')
   })
 
   it('rejects a binary file and invalid UTF-8', async () => {

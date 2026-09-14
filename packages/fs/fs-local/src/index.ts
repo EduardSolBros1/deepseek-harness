@@ -24,6 +24,7 @@ import type {
 } from '@deepseek-ai/dsh-fs'
 import {
   applyLiteralEdit,
+  keepDestinationBom,
   listDirectory,
   localDisplayPath,
   normalizeLineEndings,
@@ -35,6 +36,7 @@ import {
   readWholeBytes,
   readWholeText,
   resolveLocalTarget,
+  restoreBom,
   restoreLineEndings,
   streamWholeText,
   writeFileAtomic,
@@ -233,9 +235,16 @@ export class LocalFileSystem extends FileSystem {
       const before = diffable
         ? await readTextForDiff(target.targetKey, this.config.diffBasisMaxBytes, signal)
         : null
+      // A whole-content write owns the text, not the destination's byte-level
+      // encoding declaration: an existing BOM survives unless the caller's own
+      // content already carries one.
+      const destination = { displayPath: target.displayPath, targetKey: target.targetKey }
+      const finalContent = existing === null
+        ? content
+        : await keepDestinationBom(destination, content, signal)
       await writeFileAtomic(
         target.targetKey,
-        content,
+        finalContent,
         existing?.mode,
         signal,
         this.internals,
@@ -248,7 +257,7 @@ export class LocalFileSystem extends FileSystem {
         before,
         // LF-normalized to share the diff basis with `before` (also LF): a CRLF
         // overwrite must not read as every line changed. Line-ending restoration
-        // is a storage detail the applied-hunk diff ignores.
+        // and a retained BOM are storage details the applied-hunk diff ignores.
         after: normalizeLineEndings(content),
       }
     })
@@ -276,14 +285,20 @@ export class LocalFileSystem extends FileSystem {
 
       const original = await readForEdit(target.targetKey, target.displayPath, signal)
       const edited = applyLiteralEdit(original.content, edit.oldString, edit.newString, edit.replaceAll, target.displayPath)
-      const content = restoreLineEndings(edited.content, original.lineEndings)
+      // A literal edit replaces text, not the file's byte-level encoding: the
+      // line-ending style and the UTF-8 BOM both survive unchanged.
+      const content = restoreBom(
+        restoreLineEndings(edited.content, original.lineEndings),
+        original.bom,
+      )
       await writeFileAtomic(target.targetKey, content, existing.mode, signal, this.internals)
 
       const after = await probe(target.targetKey)
       return {
         version: this.versionAfterWrite(after, target),
-        // The LF-normalized before/after text (the applied-hunk diff basis);
-        // line-ending restoration is a storage detail the diff ignores.
+        // The LF-normalized, BOM-free before/after text (the applied-hunk diff
+        // basis); line-ending and BOM restoration are storage details the diff
+        // ignores, so neither reads as a change of its own.
         before: original.content,
         after: edited.content,
       }
